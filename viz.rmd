@@ -1,0 +1,210 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Loading libraries
+
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(gt)
+library(ggrepel)
+```
+
+```{r}
+# Importing data
+ttc.delays.2023 <- read_xlsx("TTC Subway Delay Data 2023.xlsx")
+ttc.delays.2024 <- read_xlsx("TTC Subway Delay Data 2024.xlsx")
+ttc.stations <- read_csv("TTC Subway Station Data.csv", show_col_types = FALSE)
+ttc.shapes <- read_sf("TTC Subway Shapefile/TTC_SUBWAY_LINES_WGS84.shp")
+trt.weather <- read_csv("Toronto Daily Weather Data.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Pre-processing data
+
+ttc.stations <- ttc.stations %>%
+  # Simplify TTC station names
+  mutate(stop_name_simple = str_to_title(sub(" -.*", "", stop_name))) %>%
+  # Map route IDs to readable route names 
+  mutate(route_names = case_when(
+    route_ids == "61456" ~ "Line 1",
+    route_ids == "61457" ~ "Line 2",
+    route_ids == "61459" ~ "Line 3"
+  )) %>%
+  mutate(route_ids = as.factor(route_names)) 
+
+# Combine TTC delay data from 2023 & 2024
+ttc.delays <- bind_rows(ttc.delays.2023, ttc.delays.2024) %>%
+  # Convert columns with categorical data
+  mutate(Station = factor(str_to_title(Station)),
+         Day = factor(Day, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")),
+         Line = factor(Line),
+         Date = as.Date(Date),
+         Vehicle = factor(Vehicle)) %>%
+  # Extract only the rows that correspond to stations that appear in the TTC Stations dataset
+  filter(Station %in% unique(ttc.stations$stop_name_simple))
+
+trt.weather <- trt.weather %>%
+  # Extract only the rows that are within the time frame of the TTC delays dataset
+  filter(date >= min(ttc.delays$Date)) %>%
+  filter(date <= max(ttc.delays$Date)) %>%
+  # Extract only the date and average temperature columns
+  select(date, avg_temperature)
+``` 
+
+```{r}
+# (Geographical data)
+# Showcase the subway stations on a map
+
+ggplot() +
+  # Plot the shapefile of the TTC routes
+  geom_sf(data = ttc.shapes, aes(geometry = geometry), size = 1, col = "grey40") +  
+  # Plot the points based on their longitude & latitude
+  geom_point(data = ttc.stations, aes(x = longitude, y = latitude, col = route_names)) +
+  # Label the points with TTC station names
+  geom_text_repel(data = ttc.stations %>% 
+                    # Simplify the station name more to eliminate clutter
+                    mutate(stop_name_simple = sub(" Station", "", stop_name_simple)) %>% 
+                    distinct(longitude, latitude, .keep_all = TRUE),
+                  aes(x = longitude, y = latitude, label = stop_name_simple),
+                  size = 2, box.padding = 0.2, max.overlaps = 20, color = "grey20") +
+  # Color-code the points based on which subway line they belong to
+  scale_color_manual(
+    name = "Subway Line",
+    values = c("Line 1" = "#fe9f07", 
+               "Line 2" = "#38d555", 
+               "Line 3" = "#d070fb")
+  ) +
+  labs(title = "TTC Subway Stations", 
+       subtitle = "Color-coded by Subway Line") +
+  theme_void() 
+```
+```{r}
+# (Table package)
+# Showcase the subway stations with the most delays by week day
+
+# Extract stations that belong to each subway line
+line1_stations <- ttc.stations$stop_name_simple[
+  ttc.stations$route_names == "Line 1"
+]
+line2_stations <- ttc.stations$stop_name_simple[
+  ttc.stations$route_names == "Line 2"
+]
+line3_stations <- ttc.stations$stop_name_simple[
+  ttc.stations$route_names == "Line 3"
+]
+
+ttc.delays %>%
+  group_by(Day, Station) %>%
+  # Compute total delay time based on the day of the week
+  summarise(`Total Delay` = sum(`Min Delay`, na.rm = TRUE)) %>%
+  # Select top 3 stations based on the day of the week
+  slice_max(`Total Delay`, n = 3) %>%
+  # Arrange data in descending order by total delay time
+  arrange(Day, desc(`Total Delay`)) %>%
+  # Group the table by day of the week
+  gt(groupname_col = "Day") %>%
+  # Add table title & subtitle
+  tab_header(
+    title = "Top Stations by Total Delay Time",
+    subtitle = "Grouped by Day of the Week"
+  ) %>%
+  # Style the group header
+  tab_options(
+    row_group.background.color = "grey20",
+    row_group.font.weight = "bold",
+    row_group.text_transform = "uppercase",
+  ) %>%
+  # Highlight and bold the row corresponding to the maximum total delay time
+  tab_style(
+    style = list(cell_text(weight = "bold"), cell_fill(color = "#fffdda")),
+    locations = cells_body(
+      rows = `Total Delay` == max(`Total Delay`)
+    )
+  ) %>%
+  # Color-code the row based on the subway line that the station belongs to
+  tab_style(
+    style = cell_text(color = "#fe9f07"),
+    locations = cells_body(
+      columns = c(Station),
+      rows = Station %in% line1_stations
+      )
+    ) %>%
+  tab_style(
+    style = cell_text(color = "#38d555"),
+    locations = cells_body(
+      columns = c(Station),
+      rows = Station %in% line2_stations
+      )
+    ) %>%
+  tab_style(
+    style = cell_text(color = "#d070fb"),
+    locations = cells_body(
+      columns = c(Station),
+      rows = Station %in% line3_stations
+      )
+    ) %>%
+  # Make table wide
+  tab_options(
+    table.width = pct(100),
+    ) %>%
+  # Refine table alignment
+  cols_align(
+    align = "left",
+    columns = c(Station, `Total Delay`) 
+    )
+```
+
+```{r}
+# (Categorical element)
+# Showcase the weekly pattern of the total delay time for the top 3 stations with the most frequent delays
+
+# Determine the top 3 stations based on total delay time
+top_3_delays <- ttc.delays %>%
+  group_by(Station) %>%
+  summarise(`Total Delay` = sum(as.numeric(`Min Delay`), na.rm = TRUE)) %>%
+  arrange(desc(`Total Delay`)) %>%
+  slice_head(n = 3)
+
+ttc.delays %>%
+  # Extract the top 3 stations based on total delay time
+  filter(Station %in% top_3_delays$Station) %>%
+  # Compute total delay time by day
+  group_by(Station, Day) %>%
+  summarise(`Total Delay` = sum(as.numeric(`Min Delay`), na.rm = TRUE), .groups = "drop") %>%
+  # Create a side-by-side bar plot for total delay time across days of the week grouped by station
+  ggplot(aes(x = Day, y = `Total Delay`, fill = Station)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Total Delay Time by Day of Week",
+    subtitle = "for the 3 subway stations with the most delay",
+    x = "Day of Week",
+    y = "Total Delay (minutes)",
+    fill = "Station"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+``` 
+
+```{r}
+# (Multiple continuous variables)
+# Showcase the relationship between total delay time and daily climate over date-time
+
+ttc.delays %>%
+  # Compute average delay time per day
+  group_by(Date) %>%
+  summarise(`Average Delay` = mean(as.numeric(`Min Delay`), na.rm = TRUE)) %>%
+  # Append data on average daily temperature
+  left_join(trt.weather,
+            by = c("Date" = "date")) %>%
+  # Create line plot of average delay time over time colour-coded by daily temperature
+  ggplot(aes(x = Date, y = `Average Delay`, colour = avg_temperature)) +
+  geom_line() +
+  scale_color_viridis_c(name = "Daily\nTemperature", option = "A") +
+  theme_minimal() +
+  labs(title = "Average Subway Delay Over Time",
+       y = "Average Delay (minutes)") 
+```
